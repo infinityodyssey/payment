@@ -1,0 +1,34 @@
+# Keep the build context small and keep secrets out of image layers.
+#
+# A .env file copied into a layer is readable by anyone who can pull the image, and
+# `docker history` survives deletion of the running container. Nothing below belongs in
+# an image.
+
+.git
+.gitignore
+.idea
+*.iml
+.vscode
+
+# Secrets and local overrides. Never in a layer.
+docker/env/*.env
+!docker/env/*.env.example
+**/*.p12
+**/*.jks
+**/*.pem
+**/*.key
+**/application-local.properties
+
+# Build output of OTHER modules. The Dockerfile copies exactly one jar, named by the
+# SERVICE build argument, so everything else is noise that invalidates the cache.
+**/target/classes
+**/target/test-classes
+**/target/generated-sources
+**/target/maven-status
+**/target/surefire-reports
+**/target/*.jar.original
+
+# Documentation and diagrams
+*.md
+architecture/
+docs/

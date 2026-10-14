@@ -1,0 +1,288 @@
+# One compose file, three environments, two server roles.
+#
+# Which services start is chosen by profile, not by a separate file per environment -
+# separate files drift, and a setting that exists in uat.yml but not prod.yml is found in
+# production. What changes between environments is the env file only.
+#
+#   dev     docker compose --env-file env/dev.env  --profile app --profile worker up -d
+#             (no redis profile: development uses the Redis already running on your machine)
+#   redis   docker compose --env-file env/prod.env --profile redis up -d       (Redis host only)
+#   app     docker compose --env-file env/prod.env --profile app --profile worker up -d
+#
+# EACH SERVICE HAS ITS OWN VERSION VARIABLE, so a change in one service does not force the
+# other four to restart. APP_VERSION is the release they all come from; setting
+# AUTH_VERSION alone pins auth to a different build and leaves the rest untouched, and
+# `up -d` then recreates only that container. docker/plan-release.sh works out which
+# services actually changed; docker/deploy.sh applies them one at a time.
+#
+# The exception is payment-shared: when it changes, all five move together, because the
+# token format and the Redis key layout are a contract between them.
+#
+# See architecture/DOCKER_DEPLOYMENT.md for the full sequence.
+
+name: payment-platform
+
+# --------------------------------------------------------------------------------------
+# Settings every service shares. Defined once; a service that needs to differ overrides
+# the one key rather than repeating the block.
+# --------------------------------------------------------------------------------------
+x-service-base: &service-base
+  restart: unless-stopped
+
+  # unless-stopped, not always: `always` restarts a container you deliberately stopped
+  # when the Docker daemon comes back, which during a maintenance window means a service
+  # you took out of the pool quietly returns to it.
+
+  # Read-only root filesystem. The application writes nothing to disk - logs go to stdout
+  # and all state is in Oracle or Redis - so anything that tries to write is either Tomcat
+  # using its temp directory or something that should not be happening.
+  read_only: true
+  tmpfs:
+    # noexec matters: a writable, executable directory in a container is where a payload
+    # gets dropped. Tomcat only needs to write files there, never run them.
+    - /tmp:rw,noexec,nosuid,size=256m
+
+  security_opt:
+    - no-new-privileges:true
+
+  cap_drop:
+    - ALL
+
+  # Graceful shutdown. 45s is longer than the 30s LMS read timeout on purpose: a container
+  # stopped while a posting call is in flight gets to see that call finish and record its
+  # outcome. Cut it to Docker's default 10s and you manufacture unknown-state postings
+  # that the status check then has to resolve.
+  stop_grace_period: 45s
+
+  logging:
+    driver: json-file
+    options:
+      # CERT-In requires 180 days of ICT logs held in India. This rotation does NOT
+      # satisfy that - it is a local buffer so a log flood cannot fill the server's disk
+      # and take the service down with it. Retention lives in Loki, which Promtail ships
+      # to from these files. If Loki retention is not set to 180 days, the obligation is
+      # unmet whatever this says.
+      max-size: "100m"
+      max-file: "5"
+      tag: "{{.Name}}"
+
+  env_file:
+    - ${ENV_FILE:-env/dev.env}
+
+  environment: &service-env
+    SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-prod}
+
+    # 0.0.0.0 inside the container is correct and is NOT the same as 0.0.0.0 on a host.
+    # The properties default to 127.0.0.1 because on bare metal that is what keeps the
+    # actuator off the network. In a container, loopback is private to that container, so
+    # 127.0.0.1 would make the metrics port unreachable by Prometheus - and the container
+    # network namespace already provides the boundary the bare-metal setting was buying.
+    # What keeps it off the internet is the port binding below, to the private IP only.
+    MANAGEMENT_BIND_ADDRESS: "0.0.0.0"
+
+  # Lets a container reach a service on the host by name - the local Redis in
+  # development, for instance. `localhost` inside a container is the CONTAINER's loopback,
+  # never the host's, so a host service is unreachable by that name no matter what port it
+  # is on. Docker Desktop provides this alias already; `host-gateway` is what makes the
+  # same name work on a Linux host, so one env file works on both.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+  networks:
+    - payment
+
+# --------------------------------------------------------------------------------------
+
+services:
+
+  # ------------------------------------------------------------------ Redis
+  # Runs on ONE host for the whole environment, not on each app server. Read the note in
+  # DOCKER_DEPLOYMENT.md before deciding which host: putting it on an app server means an
+  # app deployment there logs out every borrower on all six servers.
+  redis:
+    profiles: ["redis"]
+    image: redis:7.4-alpine
+    container_name: payment-redis
+    restart: unless-stopped
+
+    # The config file holds everything except the password, which comes from the
+    # environment so the secret is never in a committed file.
+    #
+    # The emptiness check is done HERE, at container start, rather than as a
+    # `${REDIS_PASSWORD:?...}` substitution. Compose interpolates the whole file whatever
+    # profiles are active, so a required-variable marker on this line would break every
+    # `--profile app` command on a server that has no Redis password to set - which is
+    # exactly the case in development, where the local Redis has none.
+    #
+    # An unauthenticated Redis holding live AES session keys is found by scanners in
+    # minutes, so this refuses to start rather than coming up open. $$ escapes the $ so
+    # Compose passes it through to the container's shell instead of expanding it itself.
+    command: >
+      sh -c 'test -n "$$REDIS_PASSWORD" ||
+      { echo "REDIS_PASSWORD is empty. Refusing to start an unauthenticated Redis holding session keys."; exit 1; };
+      exec redis-server /usr/local/etc/redis/redis.conf --requirepass "$$REDIS_PASSWORD"'
+
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      # Named volume, not a bind mount: the AOF file must survive `docker compose down`.
+      # Without it, replacing the Redis image mid-day ends every active payment journey.
+      - redis-data:/data
+
+    ports:
+      # Bound to the private IP, never 0.0.0.0. A published port on 0.0.0.0 bypasses the
+      # host firewall on most Docker installs - iptables rules Docker inserts are
+      # evaluated before the ones a hardening script adds - so "the VCN security list
+      # blocks it" is not reliably true for a published port.
+      - "${PRIVATE_IP:?PRIVATE_IP must be set}:6379:6379"
+
+    # noeviction means Redis refuses writes when full, so the limit here must sit above
+    # the maxmemory in redis.conf (1gb) with room for the AOF buffer and COW pages during
+    # a rewrite. Set equal and a background rewrite gets the container OOM-killed.
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+    networks:
+      - payment
+
+  # ------------------------------------------------------- auth-service (8443)
+  # Handshake, ECDH session, OTP, payment token, partner token.
+  # The only service that writes session state. Runs on every server.
+  auth:
+    <<: *service-base
+    profiles: ["app"]
+    image: ${REGISTRY:-payment}/payment-auth:${AUTH_VERSION:-${APP_VERSION:?set APP_VERSION, or AUTH_VERSION for this service alone}}
+    container_name: payment-auth
+    environment:
+      <<: *service-env
+      SERVER_PORT: "8443"
+      MANAGEMENT_PORT: "8081"
+    ports:
+      - "${PRIVATE_IP:?PRIVATE_IP must be set}:8443:8443"
+      - "${PRIVATE_IP}:8081:8081"
+    deploy:
+      resources:
+        limits:
+          memory: ${AUTH_MEM:-1024M}
+          cpus: "${AUTH_CPUS:-2}"
+
+  # ------------------------------------------------------ fetch-service (8444)
+  fetch:
+    <<: *service-base
+    profiles: ["app"]
+    image: ${REGISTRY:-payment}/payment-fetch:${FETCH_VERSION:-${APP_VERSION:?set APP_VERSION, or FETCH_VERSION for this service alone}}
+    container_name: payment-fetch
+    environment:
+      <<: *service-env
+      SERVER_PORT: "8444"
+      MANAGEMENT_PORT: "8082"
+    ports:
+      - "${PRIVATE_IP:?PRIVATE_IP must be set}:8444:8444"
+      - "${PRIVATE_IP}:8082:8082"
+    deploy:
+      resources:
+        limits:
+          memory: ${FETCH_MEM:-1024M}
+          cpus: "${FETCH_CPUS:-2}"
+
+  # ---------------------------------------------------- payment-service (8445)
+  service:
+    <<: *service-base
+    profiles: ["app"]
+    image: ${REGISTRY:-payment}/payment-service:${SERVICE_VERSION:-${APP_VERSION:?set APP_VERSION, or SERVICE_VERSION for this service alone}}
+    container_name: payment-service
+    environment:
+      <<: *service-env
+      SERVER_PORT: "8445"
+      MANAGEMENT_PORT: "8083"
+    ports:
+      - "${PRIVATE_IP:?PRIVATE_IP must be set}:8445:8445"
+      - "${PRIVATE_IP}:8083:8083"
+    deploy:
+      resources:
+        limits:
+          memory: ${SERVICE_MEM:-1024M}
+          cpus: "${SERVICE_CPUS:-2}"
+
+  # ---------------------------------------------------- posting-service (8446)
+  # Vendor callback and partner posting ingress. This is the second ingress path the
+  # network team allowlists; it takes traffic from the vendor, not from a browser.
+  posting:
+    <<: *service-base
+    profiles: ["app"]
+    image: ${REGISTRY:-payment}/payment-posting:${POSTING_VERSION:-${APP_VERSION:?set APP_VERSION, or POSTING_VERSION for this service alone}}
+    container_name: payment-posting
+    environment:
+      <<: *service-env
+      SERVER_PORT: "8446"
+      MANAGEMENT_PORT: "8084"
+    ports:
+      - "${PRIVATE_IP:?PRIVATE_IP must be set}:8446:8446"
+      - "${PRIVATE_IP}:8084:8084"
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTING_MEM:-1024M}
+          cpus: "${POSTING_CPUS:-2}"
+
+  # --------------------------------------------------------- payment-worker
+  # No ingress. Drains the posting queue to the LMS, runs the sweeper and reconciliation.
+  #
+  # Its own profile because the count is a capacity decision, not a given. Every worker
+  # you start is another claimant on the queue, and the agreed LMS posting ceiling
+  # (300/min now, 600/min later) is shared across all of them. Six workers each running
+  # their own batch rate will breach a ceiling that two workers respect. Either divide the
+  # target by the worker count in LMS_POSTING_RATE or share the Redis token bucket at
+  # rl:lms-posting - see payment-worker/README.md. Decide which, then set the profile on
+  # the servers that should run it.
+  worker:
+    <<: *service-base
+    profiles: ["worker"]
+    image: ${REGISTRY:-payment}/payment-worker:${WORKER_VERSION:-${APP_VERSION:?set APP_VERSION, or WORKER_VERSION for this service alone}}
+    container_name: payment-worker
+    environment:
+      <<: *service-env
+      # 0 means an ephemeral port. The worker serves no business HTTP at all.
+      SERVER_PORT: "0"
+      MANAGEMENT_PORT: "8085"
+    ports:
+      # No application port, but the management port is published anyway. The worker is
+      # where duplicate postings and queue backlogs would show up first, so it is the last
+      # service that should be invisible to Prometheus.
+      - "${PRIVATE_IP:?PRIVATE_IP must be set}:8085:8085"
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEM:-1024M}
+          cpus: "${WORKER_CPUS:-2}"
+
+networks:
+  payment:
+    driver: bridge
+    # Fixed subnet so the VCN security lists and the Oracle/LMS firewall rules have a
+    # stable source range to allowlist. Docker's default pool picks a different subnet per
+    # host, which turns one firewall rule into six.
+    ipam:
+      config:
+        - subnet: ${DOCKER_SUBNET:-172.28.0.0/16}
+
+volumes:
+  redis-data:
+    driver: local

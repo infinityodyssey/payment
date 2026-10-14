@@ -1,0 +1,22 @@
+target/
+*.class
+
+# Filled-in environment files hold the Oracle password, the Redis password, the token
+# HMAC secret and the OTP pepper. Only the .example files are committed.
+docker/env/*.env
+!docker/env/*.env.example
+
+# Keystores and certificates
+*.p12
+*.jks
+*.pem
+*.key
+*.crt
+
+# Local overrides
+**/application-local.properties
+
+.idea/
+*.iml
+.vscode/
+.DS_Store
