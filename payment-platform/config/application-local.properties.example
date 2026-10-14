@@ -1,0 +1,60 @@
+# Credentials for running a jar directly, outside Docker.
+#
+#   cp config/application-local.properties.example config/application-local.properties
+#   # fill it in, then:
+#   java -jar payment-auth/target/payment-auth-1.0.0-SNAPSHOT.jar \
+#        --spring.profiles.active=dev,local
+#
+# WHY THIS FILE AND NOT AN ENVIRONMENT VARIABLE. Spring Boot automatically reads
+# ./config/ next to the working directory — no flag, no classpath change, nothing to
+# remember. Exporting ORACLE_PASSWORD into a shell instead puts it in that shell's
+# history and in /proc for anything on the box to read, and it is gone the next time you
+# open a terminal, so people end up pasting it into a script that gets committed.
+#
+# COPY THE JAR AND THIS FILE TOGETHER when you hand a build to someone for validation:
+#
+#   validation/
+#     payment-auth-1.0.0-SNAPSHOT.jar
+#     config/
+#       application-local.properties      <- this file, filled in
+#
+#   cd validation && java -jar payment-auth-*.jar --spring.profiles.active=dev,local
+#
+# `config/*.properties` is git-ignored and .dockerignore'd. Only the .example is
+# committed. If this file is ever in a commit, the password in it is burned — rotate it,
+# do not just delete the file.
+#
+# Permissions. On a shared machine:  chmod 600 config/application-local.properties
+#
+# THIS IS NOT A SECRETS MANAGER. It is the right place for a development or UAT
+# credential that a human runs a jar with. Production credentials belong in OCI Vault or
+# an env file owned by root on that server, never in a file that travels with a jar.
+
+# --- Oracle ----------------------------------------------------------------------------
+spring.datasource.url=jdbc:oracle:thin:@//localhost:1521/XEPDB1
+spring.datasource.username=payment_dev
+spring.datasource.password=
+spring.jpa.properties.hibernate.default_schema=PAYMENT_DEV
+
+# --- Redis -----------------------------------------------------------------------------
+# The dev profile already defaults to localhost:6363, so these are only needed if yours
+# differs.
+# spring.data.redis.host=localhost
+# spring.data.redis.port=6363
+# spring.data.redis.password=
+
+# --- Secrets the services refuse to start without ----------------------------------------
+# openssl rand -base64 48
+# The same value must be used by every service you run, or a token issued by auth is
+# rejected by the others.
+app.security.token-hmac-secret=
+auth.otp-pepper=
+app.security.actuator-password=
+
+# --- Upstreams ---------------------------------------------------------------------------
+app.global.lms-token-url=https://lms-uat.internal/api/getEXApiToken
+app.global.lms-fetch-url=https://lms-uat.internal/api/goldLoanFetch
+auth.sms.token-url=https://sms-uat.internal/api/token
+auth.sms.send-url=https://sms-uat.internal/api/send
+
+app.security.cors.allowed-origins=https://localhost:4200

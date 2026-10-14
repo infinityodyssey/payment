@@ -1,0 +1,23 @@
+# Keep secrets out of image layers and keep the build context small.
+.git
+.idea
+.vscode
+
+docker/env/*.env
+config/*.properties
+**/*.p12
+**/*.jks
+**/*.pem
+**/*.key
+
+# The Dockerfile copies one jar, named by the SERVICE build arg. Everything else in
+# target/ only invalidates the cache.
+**/target/classes
+**/target/test-classes
+**/target/generated-sources
+**/target/maven-status
+**/target/surefire-reports
+**/target/*.jar.original
+
+*.md
+architecture/

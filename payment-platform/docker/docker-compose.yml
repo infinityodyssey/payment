@@ -1,0 +1,141 @@
+# Profiles pick what runs. Env file picks the environment.
+#
+#   dev    docker compose --env-file env/dev.env  --profile dev --profile app --profile worker up -d
+#   app    docker compose --env-file env/prod.env --profile app --profile worker up -d
+#
+# The `dev` profile is a Redis for local development only. UAT and production use the
+# Redis the infra team runs; nothing here starts one.
+#
+# Each service has its own *_VERSION, defaulting to APP_VERSION, so a fix in one service
+# recreates only that container. The exception is payment-shared: when it changes, all
+# five move together, because it owns the token format and the Redis key layout and a
+# mixed set means a token minted by one service is rejected by another.
+
+name: payment-platform
+
+x-service: &service
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=256m
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  # Longer than the 30s LMS read timeout, so a container stopped mid-posting sees the
+  # call finish. Docker's default 10s manufactures unknown-state postings.
+  stop_grace_period: 45s
+  logging:
+    driver: json-file
+    options: { max-size: "100m", max-file: "5" }
+  env_file: [ "${ENV_FILE:-env/dev.env}" ]
+  environment: &env
+    SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-prod}
+    # The properties default to 127.0.0.1, which is right on bare metal. In a container
+    # loopback is private to that container, so Prometheus could never reach it. What
+    # keeps the port private here is the binding to PRIVATE_IP below.
+    MANAGEMENT_BIND_ADDRESS: "0.0.0.0"
+  # Lets a container reach a service on the host by name. `localhost` in a container is
+  # the container's own loopback, so a host service is unreachable by that name.
+  extra_hosts: [ "host.docker.internal:host-gateway" ]
+  networks: [payment]
+
+services:
+
+  # Local development only. If you already run Redis on 6363, skip --profile dev; this
+  # would fail to bind the port.
+  redis:
+    profiles: ["dev"]
+    image: redis:7.4-alpine
+    container_name: payment-redis-dev
+    command: redis-server /etc/redis.conf
+    volumes:
+      - ./redis-dev.conf:/etc/redis.conf:ro
+      - redis-dev-data:/data
+    ports: ["127.0.0.1:6363:6379"]
+    networks: [payment]
+
+  auth:                                    # handshake, ECDH session, OTP, tokens
+    <<: *service
+    profiles: ["app"]
+    image: ${REGISTRY:-payment}/payment-auth:${AUTH_VERSION:-${APP_VERSION:?set APP_VERSION}}
+    container_name: payment-auth
+    environment:
+      <<: *env
+      SERVER_PORT: "8443"
+      MANAGEMENT_PORT: "8081"
+    ports:
+      # Bound to the private IP, never 0.0.0.0 — a port published to 0.0.0.0 bypasses
+      # host iptables rules on most Docker installs, because Docker's own rules are
+      # evaluated first.
+      - "${PRIVATE_IP:?set PRIVATE_IP to this server's address}:8443:8443"
+      - "${PRIVATE_IP}:8081:8081"
+    deploy: { resources: { limits: { memory: "${AUTH_MEM:-1024M}", cpus: "${AUTH_CPUS:-2}" } } }
+
+  fetch:                                   # customer and dues detail reads
+    <<: *service
+    profiles: ["app"]
+    image: ${REGISTRY:-payment}/payment-fetch:${FETCH_VERSION:-${APP_VERSION:?set APP_VERSION}}
+    container_name: payment-fetch
+    environment:
+      <<: *env
+      SERVER_PORT: "8444"
+      MANAGEMENT_PORT: "8082"
+    ports:
+      - "${PRIVATE_IP:?set PRIVATE_IP to this server's address}:8444:8444"
+      - "${PRIVATE_IP}:8082:8082"
+    deploy: { resources: { limits: { memory: "${FETCH_MEM:-1024M}", cpus: "${FETCH_CPUS:-2}" } } }
+
+  service:                                 # vendor eligibility, initiation, tvstxnid
+    <<: *service
+    profiles: ["app"]
+    image: ${REGISTRY:-payment}/payment-service:${SERVICE_VERSION:-${APP_VERSION:?set APP_VERSION}}
+    container_name: payment-service
+    environment:
+      <<: *env
+      SERVER_PORT: "8445"
+      MANAGEMENT_PORT: "8083"
+    ports:
+      - "${PRIVATE_IP:?set PRIVATE_IP to this server's address}:8445:8445"
+      - "${PRIVATE_IP}:8083:8083"
+    deploy: { resources: { limits: { memory: "${SERVICE_MEM:-1024M}", cpus: "${SERVICE_CPUS:-2}" } } }
+
+  posting:                                 # vendor callback and partner posting ingress
+    <<: *service
+    profiles: ["app"]
+    image: ${REGISTRY:-payment}/payment-posting:${POSTING_VERSION:-${APP_VERSION:?set APP_VERSION}}
+    container_name: payment-posting
+    environment:
+      <<: *env
+      SERVER_PORT: "8446"
+      MANAGEMENT_PORT: "8084"
+    ports:
+      - "${PRIVATE_IP:?set PRIVATE_IP to this server's address}:8446:8446"
+      - "${PRIVATE_IP}:8084:8084"
+    deploy: { resources: { limits: { memory: "${POSTING_MEM:-1024M}", cpus: "${POSTING_CPUS:-2}" } } }
+
+  # No ingress. Drains the posting queue to the LMS, sweeper, reconciliation.
+  #
+  # Its own profile because the count is a capacity decision: the agreed LMS posting
+  # ceiling (300/min, later 600) is a platform total shared by every worker you start.
+  # Six workers each at their own batch rate will breach what two workers respect.
+  worker:
+    <<: *service
+    profiles: ["worker"]
+    image: ${REGISTRY:-payment}/payment-worker:${WORKER_VERSION:-${APP_VERSION:?set APP_VERSION}}
+    container_name: payment-worker
+    environment:
+      <<: *env
+      SERVER_PORT: "0"
+      MANAGEMENT_PORT: "8085"
+    ports:
+      - "${PRIVATE_IP:?set PRIVATE_IP to this server's address}:8085:8085"
+    deploy: { resources: { limits: { memory: "${WORKER_MEM:-1024M}", cpus: "${WORKER_CPUS:-2}" } } }
+
+networks:
+  payment:
+    driver: bridge
+    # Fixed so the Oracle and LMS firewall teams allowlist one range, not six.
+    ipam:
+      config: [{ subnet: "${DOCKER_SUBNET:-172.28.0.0/16}" }]
+
+volumes:
+  redis-dev-data:
