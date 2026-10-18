@@ -1,0 +1,18 @@
+target/
+*.class
+
+# Secrets. Only the .example files are committed.
+docker/env/*.env
+!docker/env/*.env.example
+config/*.properties
+!config/*.properties.example
+
+*.p12
+*.jks
+*.pem
+*.key
+
+.idea/
+*.iml
+.vscode/
+.DS_Store
