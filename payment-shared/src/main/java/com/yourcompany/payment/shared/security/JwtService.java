@@ -112,10 +112,18 @@ public class JwtService {
     }
 
     /**
-     * Verifies a borrower token against the session it arrived on and the agreement being
-     * operated on. Both bindings are mandatory; there is no overload that skips them.
+     * Everything that can be checked before the request body exists: signature,
+     * algorithm, issuer, audience, expiry, and the binding to THIS session.
+     *
+     * Called by BorrowerAuthFilter. The returned claims carry the agreement hash, so the
+     * second half of the binding can be checked once the decrypted body is available —
+     * see {@link #requireAgreement}.
+     *
+     * Split in two because the agreement number lives in the AES-GCM encrypted body, and
+     * a servlet filter runs before the decryption advice. Trying to do it all in one
+     * place is what put header parsing in a controller.
      */
-    public TokenClaims verifyBorrowerToken(String presented, String sessionId, String agreementNumber) {
+    public TokenClaims verifyBorrowerToken(String presented, String sessionId) {
         JWTClaimsSet claims = parseAndVerify(
                 presented, props.getSecurity().getTokenHmacSecret(), AUD_BORROWER);
 
@@ -124,14 +132,24 @@ public class JwtService {
             throw invalidToken();
         }
 
-        String presentedHash = stringClaim(claims, CLAIM_AGREEMENT_HASH);
-        if (!constantTimeEquals(presentedHash, agreementHash(agreementNumber))) {
+        return toTokenClaims(claims);
+    }
+
+    /**
+     * The other half of the borrower binding: the agreement in the request must be the
+     * one the token was issued for.
+     *
+     * MANDATORY on every borrower endpoint that names an agreement. A token verified by
+     * the filter alone proves the caller owns the session, not that they may operate on
+     * this loan — and the agreement number arrives in a body field the caller writes.
+     * Skipping this is an IDOR: change one field, read another borrower's loan.
+     */
+    public void requireAgreement(TokenClaims claims, String agreementNumber) {
+        if (!constantTimeEquals(claims.agreementHash(), agreementHash(agreementNumber))) {
             log.warn("Borrower token presented against a different agreement on session {}",
-                    Mask.sessionTail(sessionId));
+                    Mask.sessionTail(claims.subject()));
             throw invalidToken();
         }
-
-        return toTokenClaims(claims);
     }
 
     // ============================================================== partner tokens
@@ -293,7 +311,10 @@ public class JwtService {
         }
 
         return new TokenClaims(claims.getSubject(), claims.getJWTID(),
-                Set.copyOf(roles), claims.getExpirationTime().toInstant());
+                Set.copyOf(roles), claims.getExpirationTime().toInstant(),
+                // Null on a user token; present on a borrower token so the agreement
+                // binding can be completed after the body is decrypted.
+                stringClaim(claims, CLAIM_AGREEMENT_HASH));
     }
 
     /**

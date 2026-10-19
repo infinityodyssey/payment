@@ -11,7 +11,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
@@ -30,12 +29,18 @@ import java.util.List;
  * The principal is the username from inside the signature, never a header the caller
  * sets.
  *
- * Mount it only on the paths that need it. It rejects a request with no Authorization
+ * Mount it only on the paths that need it: it rejects a request with no Authorization
  * header, which is correct for a partner endpoint and wrong for the token endpoint
- * itself — see FilterRegistrationConfig.
+ * itself.
+ *
+ * Not a {@code @Component}: each service declares it as a bean in its own SecurityConfig.
+ * An auto-registered filter runs on every request in every service with payment-shared on
+ * the classpath — including /api/v1/partner/token, which has no bearer token yet, so no
+ * partner could ever obtain one — and the only fix is remembering a
+ * FilterRegistrationBean to switch it off again. An explicit bean makes "this service
+ * needs this filter" a statement rather than an omission.
  */
 @Slf4j
-@Component
 @RequiredArgsConstructor
 public class PartnerAuthFilter extends OncePerRequestFilter {
 

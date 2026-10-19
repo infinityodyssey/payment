@@ -1,9 +1,12 @@
 package com.yourcompany.payment.fetch.config;
 
 import com.yourcompany.payment.shared.security.AntiReplayFilter;
+import com.yourcompany.payment.shared.security.BorrowerAuthFilter;
+import com.yourcompany.payment.shared.security.JwtService;
 import com.yourcompany.payment.shared.security.PartnerAuthFilter;
 import com.yourcompany.payment.shared.security.Role;
 import com.yourcompany.payment.shared.security.SessionContextFilter;
+import com.yourcompany.payment.shared.web.ApiErrorWriter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -42,8 +45,23 @@ public class SecurityConfig {
 
     private final SessionContextFilter sessionContextFilter;
     private final AntiReplayFilter antiReplayFilter;
-    private final PartnerAuthFilter partnerAuthFilter;
     private final CorsConfigurationSource corsConfigurationSource;
+    private final JwtService jwtService;
+    private final ApiErrorWriter errorWriter;
+
+    /**
+     * The two token filters are beans here rather than @Component in payment-shared, so
+     * a service declares the ones it needs instead of switching off the ones it does not.
+     */
+    @Bean
+    public PartnerAuthFilter partnerAuthFilter() {
+        return new PartnerAuthFilter(jwtService, errorWriter);
+    }
+
+    @Bean
+    public BorrowerAuthFilter borrowerAuthFilter() {
+        return new BorrowerAuthFilter(jwtService, errorWriter);
+    }
 
     @Bean
     @Order(2)
@@ -70,7 +88,7 @@ public class SecurityConfig {
                 // somebody decides which role it needs, which is the correct way round.
                 .anyRequest().denyAll())
 
-            .addFilterBefore(partnerAuthFilter, UsernamePasswordAuthenticationFilter.class);
+            .addFilterBefore(partnerAuthFilter(), UsernamePasswordAuthenticationFilter.class);
 
         return http.build();
     }
@@ -108,17 +126,22 @@ public class SecurityConfig {
                 .authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)))
 
             .authorizeHttpRequests(auth -> auth
-                // ROLE_SESSION comes from SessionContextFilter and means only "a live
-                // session resolved". It is NOT authorisation to fetch: the borrower JWT,
-                // bound to this session and this agreement, is verified in FetchService.
-                // Two gates, because a session alone proves the browser got through the
-                // handshake, not that the OTP was ever verified.
+                // ROLE_BORROWER, not ROLE_SESSION. A resolved session only proves the
+                // browser completed the handshake; ROLE_BORROWER is set by
+                // BorrowerAuthFilter after it verifies the JWT, so an endpoint that
+                // forgets to look at the token is still gated here.
+                //
+                // The agreement half of the binding cannot be checked at this layer — it
+                // is in the encrypted body — so FetchService calls requireAgreement.
                 .requestMatchers(m.matcher(HttpMethod.POST, "/api/v1/payment/fetch-details"))
-                        .hasAuthority("ROLE_SESSION")
+                        .hasAuthority(Role.BORROWER)
                 .anyRequest().denyAll())
 
+            // Order is the contract: replay check, then session resolution, then token
+            // verification, which needs the session id the previous filter produced.
             .addFilterBefore(antiReplayFilter, UsernamePasswordAuthenticationFilter.class)
-            .addFilterAfter(sessionContextFilter, AntiReplayFilter.class);
+            .addFilterAfter(sessionContextFilter, AntiReplayFilter.class)
+            .addFilterAfter(borrowerAuthFilter(), SessionContextFilter.class);
 
         return http.build();
     }

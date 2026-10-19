@@ -1,7 +1,6 @@
 package com.yourcompany.payment.auth.config;
 
 import com.yourcompany.payment.shared.security.AntiReplayFilter;
-import com.yourcompany.payment.shared.security.PartnerAuthFilter;
 import com.yourcompany.payment.shared.security.SessionContextFilter;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
@@ -30,18 +29,6 @@ public class FilterRegistrationConfig {
     @Bean
     public FilterRegistrationBean<SessionContextFilter> disableSessionAutoRegistration(SessionContextFilter f) {
         FilterRegistrationBean<SessionContextFilter> r = new FilterRegistrationBean<>(f);
-        r.setEnabled(false);
-        return r;
-    }
-
-    /**
-     * Without this the partner filter would run on EVERY request, including
-     * /api/v1/partner/token itself — which has no bearer token yet, so no partner could
-     * ever obtain one. It belongs only on the chains that put it there explicitly.
-     */
-    @Bean
-    public FilterRegistrationBean<PartnerAuthFilter> disablePartnerAuthAutoRegistration(PartnerAuthFilter f) {
-        FilterRegistrationBean<PartnerAuthFilter> r = new FilterRegistrationBean<>(f);
         r.setEnabled(false);
         return r;
     }

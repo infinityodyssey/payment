@@ -11,11 +11,16 @@ import java.util.Set;
  * has been checked — there is no other way to construct one from a request, which is the
  * point: a controller cannot accidentally read claims out of an unverified token.
  *
- * @param subject sessionId for a borrower token, partner code for a partner token
- * @param tokenId the jti, for correlating the audit trail
- * @param roles   what the holder may do. Authorisation reads this and nothing else.
+ * @param subject       sessionId for a borrower token, username for a user token
+ * @param tokenId       the jti, for correlating the logs
+ * @param roles         what the holder may do. Authorisation reads this and nothing else.
+ * @param agreementHash borrower tokens only: the keyed hash of the agreement the token
+ *                      was issued for. Its presence means one check is still outstanding
+ *                      — JwtService.requireAgreement, once the body is decrypted. Null on
+ *                      a user token, which is bound to no agreement.
  */
-public record TokenClaims(String subject, String tokenId, Set<String> roles, Instant expiresAt) {
+public record TokenClaims(String subject, String tokenId, Set<String> roles, Instant expiresAt,
+                          String agreementHash) {
 
     public boolean hasRole(String role) {
         return roles.contains(role);

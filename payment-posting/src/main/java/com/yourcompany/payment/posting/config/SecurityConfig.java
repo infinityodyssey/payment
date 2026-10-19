@@ -1,9 +1,10 @@
 package com.yourcompany.payment.posting.config;
 
+import com.yourcompany.payment.shared.security.JwtService;
 import com.yourcompany.payment.shared.security.PartnerAuthFilter;
 import com.yourcompany.payment.shared.security.Role;
+import com.yourcompany.payment.shared.web.ApiErrorWriter;
 import lombok.RequiredArgsConstructor;
-import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
@@ -35,7 +36,14 @@ import org.springframework.security.web.servlet.util.matcher.PathPatternRequestM
 @RequiredArgsConstructor
 public class SecurityConfig {
 
-    private final PartnerAuthFilter partnerAuthFilter;
+    private final JwtService jwtService;
+    private final ApiErrorWriter errorWriter;
+
+    /** A bean, not a @Component, so it runs only where this config puts it. */
+    @Bean
+    public PartnerAuthFilter partnerAuthFilter() {
+        return new PartnerAuthFilter(jwtService, errorWriter);
+    }
 
     @Bean
     @Order(2)
@@ -60,7 +68,7 @@ public class SecurityConfig {
                 // role it needs, which is the correct way round.
                 .anyRequest().denyAll())
 
-            .addFilterBefore(partnerAuthFilter, UsernamePasswordAuthenticationFilter.class);
+            .addFilterBefore(partnerAuthFilter(), UsernamePasswordAuthenticationFilter.class);
 
         return http.build();
     }
@@ -86,13 +94,5 @@ public class SecurityConfig {
                 .anyRequest().denyAll());
 
         return http.build();
-    }
-
-    /** Or the filter runs on every request, including the ones with no bearer token. */
-    @Bean
-    public FilterRegistrationBean<PartnerAuthFilter> disablePartnerAuthAutoRegistration(PartnerAuthFilter f) {
-        FilterRegistrationBean<PartnerAuthFilter> r = new FilterRegistrationBean<>(f);
-        r.setEnabled(false);
-        return r;
     }
 }

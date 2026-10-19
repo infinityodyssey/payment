@@ -6,7 +6,7 @@ One capability, two front doors:
 
 | Path | Caller | Auth | Agreement from | Data from |
 |---|---|---|---|---|
-| `POST /api/v1/payment/fetch-details` | browser | session cookie + `X-Session-Id`, nonce, encrypted body, borrower JWT | the token binding | session snapshot, LMS as fallback |
+| `POST /api/v1/payment/fetch-details` | browser | session cookie + `X-Session-Id`, nonce, encrypted body, borrower JWT | **the session** | session snapshot, LMS as fallback |
 | `POST /api/v1/partner/fetch-details` | partner | bearer JWT, `aud=user`, role VENDOR or ADMIN | the request body | always a fresh LMS call |
 
 Both land in `FetchService` and get the same validation, the same dues arithmetic, the
@@ -31,28 +31,63 @@ assume the split: `SessionContextFilter` and `AntiReplayFilter` both exclude
 { "agreementNumber": "GL0001234567", "chargeType": "CURRENT_DUE", "paymentVendor": "PAYTM" }
 ```
 
-`agreementNumber` means different things on the two paths, and this is the part worth
-understanding:
+`agreementNumber` means different things on the two paths:
 
-- **Borrower** — it *proves* the token binding, it does not select the data.
-  `verifyBorrowerToken` recomputes the keyed agreement hash from this value and compares
-  it with the one inside the signature. Changing it to someone else's agreement fails
-  before any data is fetched.
 - **Partner** — it *selects* the agreement, because a partner token is bound to none. A
   partner is authorised to act for many borrowers; what limits them is their role.
+- **Borrower** — it selects **nothing**. The agreement comes from the session, where
+  auth-service put it when it looked the borrower up to send the OTP. A value here that
+  disagrees is logged and ignored. It is read only as a fallback when the session snapshot
+  has expired, and even then the token's agreement hash has to match it.
+
+Because the agreement is a server-side value in the normal path, there is no
+caller-controlled reference to tamper with at all.
 
 ## The validation chain, in order
 
-1. Bean validation on the DTO — shape and length only.
-2. **Browser:** cookie/header pair (CSRF), nonce + timestamp (replay), session key exists
-   (`SessionContextFilter`), body decrypts. **Partner:** JWT signature, algorithm pinned
-   to HS256, issuer, audience, expiry (`PartnerAuthFilter`), role matched in the chain.
-3. Borrower JWT verified against **both** the session and the agreement, in `FetchService`.
-   `ROLE_SESSION` from the filter only means "a live session resolved" — it is not
-   authorisation to fetch, because a session alone proves the handshake happened, not that
-   the OTP was ever verified.
-4. Charge type against `fetch.allowed-charge-types`.
-5. Vendor against `TVSCS_PAYMENT_VENDOR_PG`: exists, active, accepts the amount.
+**No controller touches a header, a token, or a request attribute.** Everything below
+happens in a filter or a service. The controllers declare `SessionContext` and
+`TokenClaims` as method parameters and `VerifiedCallerArgumentResolver` supplies them —
+so there is no lookup and no null check to copy into the next endpoint, and if a filter is
+not mounted the resolver fails the request instead of passing a null along. Both
+controllers are under 50 lines and contain one statement each.
+
+Browser path:
+
+| # | Where | Check |
+|---|---|---|
+| 1 | `AntiReplayFilter` | `X-Nonce` + `X-Timestamp`, 60s window, Redis `SETNX` |
+| 2 | `SessionContextFilter` | `__Host-` cookie == `X-Session-Id` (CSRF double-submit), session key exists, TTL slides |
+| 3 | `BorrowerAuthFilter` | JWT signature, algorithm pinned to HS256, issuer, audience, expiry, **and `sub` == this session**. Sets `ROLE_BORROWER`. |
+| 4 | `SecurityConfig` | `hasAuthority(ROLE_BORROWER)` |
+| 5 | decryption advice | AES-GCM body, AAD = session id |
+| 6 | bean validation | shape and length of the DTO |
+| 7 | `FetchService` | the session's agreement matched against the token's |
+| 8 | `FetchService` | charge type, then vendor |
+
+Partner path: `PartnerAuthFilter` (signature, algorithm, issuer, audience, expiry) →
+`hasAnyAuthority(VENDOR, ADMIN)` → bean validation → charge type → vendor. No session, no
+nonce, no encryption.
+
+### Why the borrower token is checked in two places
+
+The filter answers one question — **is this token valid for this session** — and sets
+`ROLE_BORROWER` so the chain can require it. It cannot do more: the agreement lives inside
+the AES-GCM encrypted body, and a servlet filter runs before the decryption advice.
+
+The service then matches **the session's agreement against the token's**. Both are
+server-side values written by auth-service at OTP time, so the borrower influences
+neither. The one case where the request value is used — an expired snapshot — is still
+gated by the token's agreement hash, so the fallback cannot reach another loan either.
+
+Step 4 is what stops a *future* endpoint being reachable with no token at all: it is
+enforced by the chain, so forgetting it is not silent.
+
+`ROLE_SESSION` is deliberately **not** what gates this endpoint. A resolved session only
+proves the browser completed the handshake, not that the OTP was ever verified.
+
+The partner path has no equivalent second step. Its token carries no agreement, so once
+the signature and role are good, it proceeds.
 
 ## Vendor checks hit the database every request — on purpose
 

@@ -2,9 +2,10 @@ package com.yourcompany.payment.fetch.service;
 
 import com.yourcompany.payment.fetch.dto.FetchDtos;
 import com.yourcompany.payment.shared.client.LmsClient;
+import com.yourcompany.payment.shared.dto.LoanDetails;
 import com.yourcompany.payment.shared.exception.ApiException;
+import com.yourcompany.payment.shared.exception.SessionException;
 import com.yourcompany.payment.shared.security.JwtService;
-import com.yourcompany.payment.shared.security.Role;
 import com.yourcompany.payment.shared.security.SessionContext;
 import com.yourcompany.payment.shared.security.TokenClaims;
 import com.yourcompany.payment.shared.session.LmsSnapshot;
@@ -48,12 +49,15 @@ import java.util.Optional;
  * so the caller knows which it got, and payment initiation must re-check the amount
  * against a fresh LMS call regardless.
  *
- * <h2>What a borrower cannot do</h2>
- * Change the agreement number in the body and read someone else's loan.
- * {@link JwtService#verifyBorrowerToken} recomputes the keyed agreement hash from the
- * value presented and compares it to the one inside the signature, so a mismatch fails
- * before any data is fetched. The body field proves the binding; it does not select the
- * data.
+ * <h2>Where the borrower's token is checked</h2>
+ * The filter answers one question — is this token valid for this session — and sets
+ * ROLE_BORROWER so the chain can require it. Signature, algorithm, issuer, audience,
+ * expiry, {@code sub} == session. That is all it can do: the agreement lives inside the
+ * AES-GCM body and a servlet filter runs before the decryption advice.
+ *
+ * The service then matches the session's agreement against the token's. Both are
+ * server-side values written by auth-service at OTP time, so the borrower cannot
+ * influence either, and the body's agreement number selects nothing.
  */
 @Slf4j
 @Service
@@ -71,25 +75,23 @@ public class FetchService {
     // ============================================================ borrower path
 
     /**
-     * @param session  resolved by SessionContextFilter from the cookie/header pair
-     * @param bearer   the borrower JWT issued at OTP verification
+     * @param session resolved by SessionContextFilter from the cookie/header pair
+     * @param claims  already verified by BorrowerAuthFilter: signature, issuer, audience,
+     *                expiry, and the binding to this session. Nothing else.
      */
     public FetchDtos.FetchResponse fetchForBorrower(FetchDtos.FetchRequest request,
                                                     SessionContext session,
-                                                    String bearer) {
-        String agreementNumber = normalise(request.getAgreementNumber());
+                                                    TokenClaims claims) {
 
-        // Binds the token to THIS session and THIS agreement. Both, every time. A token
-        // lifted from another session, or presented against another agreement, dies here.
-        TokenClaims claims = jwtService.verifyBorrowerToken(
-                bearer, session.sessionId(), agreementNumber);
-        claims.requireRole(Role.BORROWER);
+        Optional<LmsSnapshot> snapshot = snapshots.get(session.sessionId());
+
+        // THE AGREEMENT COMES FROM THE SESSION, not from the request. See
+        // resolveAgreement: the body field is a fallback for a missing snapshot and
+        // nothing more, and the token has to agree with whichever source was used.
+        String agreementNumber = resolveAgreement(session, claims, snapshot,
+                request.getAgreementNumber());
 
         String chargeType = chargeTypes.validate(request.getChargeType());
-
-        // Snapshot first. A miss is not an error — it costs one LMS call, which is the
-        // behaviour without the snapshot at all.
-        Optional<LmsSnapshot> snapshot = snapshots.get(session.sessionId());
 
         AgreementMapper.Mapped mapped;
         boolean fromSnapshot;
@@ -109,6 +111,67 @@ public class FetchService {
         return assemble(mapped, chargeType, request.getPaymentVendor(), fromSnapshot);
     }
 
+    /**
+     * Decides which agreement this request is about, for a borrower.
+     *
+     * <h3>The session is the source, not the request</h3>
+     * auth-service looked the agreement up to send the OTP and stored it against the
+     * session. That value is server-side and the borrower cannot influence it, so a
+     * borrower gets their own agreement whatever they put in the body. The body field
+     * therefore selects nothing — there is no object reference for a caller to tamper
+     * with.
+     *
+     * A body value that disagrees with the session is logged and ignored rather than
+     * rejected. The usual cause is a stale tab, not an attack, and the request is
+     * answered correctly either way.
+     *
+     * <h3>Why the body is still a fallback</h3>
+     * The snapshot can be gone — Redis restarted, or the key expired just before this
+     * request. With no session agreement there is nothing to work from, and failing
+     * would send the borrower back to the start for a cache miss. So the body value is
+     * accepted in that one case.
+     *
+     * <h3>The check that makes both sources safe</h3>
+     * {@code requireAgreement} runs on the RESOLVED value, whichever source produced it.
+     * The token's keyed agreement hash was written by auth-service at OTP verification,
+     * so the only value that passes is the one this borrower actually verified against.
+     * The fallback path cannot therefore be used to read another loan: supply a different
+     * agreement and the hash will not match.
+     */
+    private String resolveAgreement(SessionContext session,
+                                    TokenClaims claims,
+                                    Optional<LmsSnapshot> snapshot,
+                                    String fromBody) {
+
+        String fromSession = snapshot
+                .map(LmsSnapshot::getDetails)
+                .map(LoanDetails::getAgreementNumber)
+                .filter(a -> a != null && !a.isBlank())
+                .map(this::normalise)
+                .orElse(null);
+
+        String resolved;
+        if (fromSession != null) {
+            resolved = fromSession;
+            String presented = normalise(fromBody);
+            if (!presented.isEmpty() && !presented.equals(fromSession)) {
+                log.warn("Request named a different agreement than the session for {}; using the session",
+                        Mask.sessionTail(session.sessionId()));
+            }
+        } else {
+            resolved = normalise(fromBody);
+            if (resolved.isEmpty()) {
+                throw SessionException.notFound();
+            }
+            log.info("No session agreement for {}; falling back to the request value",
+                    Mask.sessionTail(session.sessionId()));
+        }
+
+        // On the resolved value, every time, from either source.
+        jwtService.requireAgreement(claims, resolved);
+        return resolved;
+    }
+
     // ============================================================= partner path
 
     /**
@@ -121,11 +184,10 @@ public class FetchService {
      */
     public FetchDtos.FetchResponse fetchForPartner(FetchDtos.FetchRequest request,
                                                    TokenClaims claims) {
-        if (!claims.hasRole(Role.VENDOR) && !claims.hasRole(Role.ADMIN)) {
-            throw new ApiException("FORBIDDEN",
-                    "This operation is not permitted for your credentials.", HttpStatus.FORBIDDEN);
-        }
-
+        // No agreement binding, and no role check here: a partner token carries no
+        // agreement, and the role is matched by the filter chain
+        // (hasAnyAuthority(VENDOR, ADMIN) in SecurityConfig) so that a path is
+        // unreachable without it rather than relying on a line in a service.
         String agreementNumber = normalise(request.getAgreementNumber());
         String chargeType = chargeTypes.validate(request.getChargeType());
 

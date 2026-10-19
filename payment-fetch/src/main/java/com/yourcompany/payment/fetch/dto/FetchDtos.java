@@ -22,13 +22,14 @@ public final class FetchDtos {
     public static class FetchRequest {
 
         /**
-         * For a BORROWER caller this is checked against the agreement the token is bound
-         * to — it proves the binding, it does not choose the data. A borrower cannot
-         * fetch someone else's agreement by changing this field; the token verification
-         * fails first.
-         *
          * For a PARTNER caller this selects the agreement, because a partner token is
-         * bound to no agreement. That is the whole difference between the two paths.
+         * bound to none.
+         *
+         * For a BORROWER caller it selects NOTHING. The agreement comes from the session —
+         * auth-service stored it when it looked the borrower up to send the OTP — and a
+         * value here that disagrees is logged and ignored. It is read only as a fallback
+         * when the session snapshot has expired, and even then the token's agreement hash
+         * has to match it, so it cannot be used to reach another loan.
          */
         @NotBlank
         @Size(max = 50)

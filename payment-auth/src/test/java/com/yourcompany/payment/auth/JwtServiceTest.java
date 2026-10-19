@@ -22,6 +22,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -73,24 +74,42 @@ class JwtServiceTest {
     @Test
     void issuedBorrowerTokenValidatesAgainstItsOwnSessionAndAgreement() {
         var issued = service.issueBorrowerToken("SES_a", "GL0001234567");
-        TokenClaims claims = service.verifyBorrowerToken(issued.token(), "SES_a", "GL0001234567");
 
+        // What the filter does.
+        TokenClaims claims = service.verifyBorrowerToken(issued.token(), "SES_a");
         assertEquals("SES_a", claims.subject());
         assertTrue(claims.hasRole(Role.BORROWER));
+
+        // What the service does once the body is decrypted.
+        assertDoesNotThrow(() -> service.requireAgreement(claims, "GL0001234567"));
     }
 
     @Test
     void borrowerTokenFromAnotherSessionIsRejected() {
         var issued = service.issueBorrowerToken("SES_victim", "GL0001234567");
         assertThrows(ApiException.class,
-                () -> service.verifyBorrowerToken(issued.token(), "SES_attacker", "GL0001234567"));
+                () -> service.verifyBorrowerToken(issued.token(), "SES_attacker"));
     }
 
     @Test
     void borrowerTokenAgainstAnotherAgreementIsRejected() {
+        // What guards the snapshot-expired fallback: a valid token for this session,
+        // pointed at an agreement it was not issued for.
         var issued = service.issueBorrowerToken("SES_a", "GL0001234567");
-        assertThrows(ApiException.class,
-                () -> service.verifyBorrowerToken(issued.token(), "SES_a", "GL9999999999"));
+        TokenClaims claims = service.verifyBorrowerToken(issued.token(), "SES_a");
+
+        assertThrows(ApiException.class, () -> service.requireAgreement(claims, "GL9999999999"));
+    }
+
+    @Test
+    void aUserTokenHasNoAgreementHashSoRequireAgreementAlwaysRejects() {
+        // Belt and braces: requireAgreement on a token that was never bound to an
+        // agreement must fail rather than pass vacuously on two nulls.
+        var issued = service.issueUserToken("acme_vendor", Role.VENDOR);
+        TokenClaims claims = service.verifyUserToken(issued.token());
+
+        assertNull(claims.agreementHash());
+        assertThrows(ApiException.class, () -> service.requireAgreement(claims, "GL0001234567"));
     }
 
     @Test
@@ -114,8 +133,7 @@ class JwtServiceTest {
                 .expirationTime(Date.from(Instant.now().minusSeconds(300)))
                 .claim("roles", List.of(Role.BORROWER))
                 .build());
-        assertThrows(ApiException.class,
-                () -> service.verifyBorrowerToken(expired, "SES_a", "GL0001234567"));
+        assertThrows(ApiException.class, () -> service.verifyBorrowerToken(expired, "SES_a"));
     }
 
     // ------------------------------------------------------------- partner tokens
@@ -207,7 +225,7 @@ class JwtServiceTest {
     void userTokenCannotBeUsedAsABorrowerToken() {
         var userToken = service.issueUserToken("acme_vendor", Role.VENDOR);
         assertThrows(ApiException.class,
-                () -> service.verifyBorrowerToken(userToken.token(), "acme_vendor", null));
+                () -> service.verifyBorrowerToken(userToken.token(), "acme_vendor"));
     }
 
     @Test
